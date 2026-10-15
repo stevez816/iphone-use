@@ -57,7 +57,16 @@ Then, once:
 1. **Plug the iPhone in**, unlock it and tap **Trust**. On Apple Silicon, if the Mac
    asks "Allow accessory to connect?", click **Allow**. If the screen never shows up,
    check System Settings > Privacy & Security > *Allow accessories to connect*.
-2. On the iPhone, **Settings > Bluetooth**: tap **iPhone Use** to pair.
+2. For a new Bluetooth bond, open a two-minute pairing window on the Mac:
+   `curl -X POST localhost:7390/bluetooth/pairing -H 'Content-Type: application/json' -d '{"device":"<device-id>"}'`
+   (Replace `<device-id>` with your USB-connected phone's ID from `/devices`.)
+   On the iPhone, **Settings > Bluetooth**: select the peripheral and confirm the
+   system Bluetooth or iPhone Use pairing prompt on the Mac, and the prompt on the
+   iPhone if present. If a code is shown, check that both devices show the same code.
+   An attempt times out after 30 seconds (the app's own prompt cancels after 25);
+   reopen the window before retrying if it expires.
+   Opening a window does not bind Bluetooth input to that USB screen: the pointer
+   verification still has to identify the correct phone.
 3. On the iPhone, **Settings > Accessibility > Touch > AssistiveTouch**: turn it on.
 
 Check it:
@@ -140,8 +149,11 @@ Every phone gets its own screen capture and its own input queue, so phones work 
 parallel.
 
 Bluetooth does not say which phone a connection belongs to. So when a new phone
-connects, iPhone Use moves the pointer through that connection and looks for the screen
-where it moved, then saves the match in
+connects, iPhone Use moves its pointer along a path and back to the starting point,
+then verifies that exactly one USB screen shows that movement. Keep the phone unlocked,
+AssistiveTouch enabled, and its screen still while this runs (about 3 seconds per host).
+Even one USB phone and one Bluetooth host must pass this check: they may be different
+phones. The verified match is saved in
 `~/Library/Application Support/iPhoneUse/pairings.json`. Each phone is matched once. If a
 match goes wrong:
 
@@ -149,6 +161,69 @@ match goes wrong:
 curl -X POST localhost:7390/match -d '{"force":true}'            # forget and match again
 curl -X POST localhost:7390/pair  -d '{"device":"<id>","host":"<uuid from unmatchedHosts>"}'
 ```
+
+`/match` with `force` removes the present phones' old bindings **before** trying again.
+A failed match leaves them unbound. Legacy, unversioned bindings are ignored because
+older versions could save guesses. `/pair` is an explicit manual override, not a
+Bluetooth pairing command: use it only after independently identifying the host UUID.
+It rejects hosts that are not connected and keeps each host assigned to at most one
+screen. Duplicate names or ID prefixes are rejected; use the full device ID.
+
+## Troubleshooting pairing and control
+
+A working screenshot proves only that USB capture works. It does not establish a
+Bluetooth input connection. In `/status`, `bluetoothHosts` lists subscribed report
+channels, `pairing` describes the Mac pairing handler, and each device's `bluetooth`
+flag requires both a verified (or explicitly assigned) binding and a live HID host.
+A tap needs both `absolutePointer` and `relativeMouse`; typing needs `keyboard`.
+Control requests fail with an error if the binding or required channel is missing.
+`ok: true` means input was accepted by the local Bluetooth transport, not that the
+phone's screen response has been verified. Check a fresh screenshot after an action.
+
+On the tested macOS 26.1 installation, `bluetoothd` rejected new peers with
+"no one to handle the request", although previously bonded phones could connect.
+Registration alone did not route incoming requests to the app. This build uses a
+two-minute, single-peer pairing window, listens for the central's connection event,
+and attaches a `CBCentralManager` client to that exact incoming peer UUID. It then
+asks that client's **private** `CBPairingAgent` to initiate MITM-protected pairing.
+Previously bonded peers do not consume the window. Pairing-agent method signatures
+are checked before use; unavailable/incompatible versions are reported in `/status`.
+No pairing request is accepted by the app without a local confirmation. First pairing
+was verified with an iPhone 12 Pro running iOS 18.6, using a different Apple Account:
+the system Bluetooth confirmation appeared, the encrypted bond succeeded, and all
+four HID input reports were subscribed. This compatibility workaround uses private
+Apple APIs and is not an App Store distribution solution; other macOS versions have
+not been validated.
+
+Initiate pairing from the intended phone and verify the corresponding Mac
+confirmation. If no prompt arrives, collect diagnostics before
+changing the phone's pairing records. Do not bind a different connected phone just
+because it is the only host in `unmatchedHosts`.
+
+```sh
+./scripts/test-bindings.sh      # local regression checks; no phone input is sent
+./scripts/diagnose.sh           # status and recent app logs; no screen images
+```
+
+On the tested iPhone 12 Pro running iOS 18.6, the pointer was visible on the physical
+display, but the USB frames did not consistently show enough pointer contrast/movement
+to pass automatic verification.
+This intentionally leaves the phone unbound. For this repair, its host UUID was
+identified from the synchronized first-pairing logs and physical pointer confirmation,
+then explicitly assigned with `/pair`. A tap opened system search and Home returned
+to the Home Screen; a second connected phone remained unmatched. This does not prove
+automatic matching works on every iOS screen. Do not lower the verification threshold
+or guess a binding just to make `bluetooth` become `true`.
+
+After restarting the final build, the tested iPhone automatically restored all four
+input reports and its saved binding. Tapping Back, scrolling Settings, opening search with Cmd-Space,
+and returning Home were verified against fresh screenshots. The 44 local regression
+checks, release build, and code-signature verification also passed.
+
+Rebuilding with ad-hoc signing may cause macOS to request Bluetooth/Camera permission
+again. Existing Bluetooth bonds and saved screen/host associations should survive an
+app restart; reconnect from the phone's Bluetooth settings if its HID reports do not
+automatically resubscribe.
 
 ## Limits
 

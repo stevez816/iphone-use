@@ -1,7 +1,11 @@
 import AppKit
 import Foundation
+import os
+
+private let appLogger = Logger(subsystem: "ai.new-wave.iphone-use", category: "app")
 
 func log(_ message: String) {
+    appLogger.info("\(message, privacy: .public)")
     let stamp = ISO8601DateFormatter.string(
         from: Date(), timeZone: .current, formatOptions: [.withTime, .withColonSeparatorInTime])
     FileHandle.standardError.write(Data("[\(stamp)] \(message)\n".utf8))

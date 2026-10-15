@@ -105,6 +105,16 @@ final class Screen: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
 final class ScreenCapture {
     static let shared = ScreenCapture()
 
+    var authorization: String {
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .notDetermined: "waiting for Camera permission"
+        case .authorized: "allowed"
+        case .denied: "denied"
+        case .restricted: "restricted"
+        @unknown default: "unknown"
+        }
+    }
+
     private let lock = NSLock()
     private var screens: [String: Screen] = [:]
 

@@ -14,12 +14,20 @@ enum Routes {
             case ("GET", "/"), ("GET", "/status"):
                 return .json([
                     "bluetooth": HIDPeripheral.shared.state,
+                    "cameraPermission": ScreenCapture.shared.authorization,
+                    "pairing": HIDPeripheral.shared.pairingStatus,
+                    "bluetoothHosts": HIDPeripheral.shared.hostDiagnostics,
                     "devices": Devices.shared.all().map(\.json),
                     "unmatchedHosts": Devices.shared.unmatchedHosts().map(\.uuidString),
                 ])
 
             case ("GET", "/devices"):
                 return .json(["devices": Devices.shared.all().map(\.json)])
+
+            case ("POST", "/bluetooth/pairing"):
+                let device = try Devices.shared.find(deviceQuery)
+                try HIDPeripheral.shared.openPairingWindow(targetName: device.screen.name)
+                return .json(["pairing": HIDPeripheral.shared.pairingStatus])
 
             case ("POST", "/match"):
                 let found = Devices.shared.match(
@@ -34,7 +42,7 @@ enum Routes {
                 guard let hostString = body["host"] as? String, let host = UUID(uuidString: hostString) else {
                     return .error("host is required (a UUID from unmatchedHosts)")
                 }
-                Devices.shared.pair(try Devices.shared.find(deviceQuery), host: host)
+                try Devices.shared.pair(Devices.shared.find(deviceQuery), host: host)
                 return .json(["devices": Devices.shared.all().map(\.json)])
 
             case ("GET", "/screenshot"):
@@ -62,34 +70,43 @@ enum Routes {
             }
 
             let device = try Devices.shared.find(deviceQuery)
-            let input = try Devices.shared.input(for: device)
-            switch (request.method, request.path) {
-            case ("POST", "/tap"):
-                let (x, y) = try point(body, "x", "y", on: device)
-                input.tap(x: x, y: y, hold: (body["hold"] as? Double) ?? 0.08)
-            case ("POST", "/swipe"):
-                let from = try point(body, "x1", "y1", on: device)
-                let to = try point(body, "x2", "y2", on: device)
-                input.swipe(from: from, to: to, duration: (body["duration"] as? Double) ?? 0.3)
-            case ("POST", "/move"):
-                let (x, y) = try point(body, "x", "y", on: device)
-                input.move(x: x, y: y)
-            case ("POST", "/nudge"):
-                input.nudge(
-                    dx: (body["dx"] as? Int) ?? 0, dy: (body["dy"] as? Int) ?? 0,
-                    click: (body["click"] as? Bool) ?? false)
-            case ("POST", "/type"):
-                guard let text = body["text"] as? String else { return .error("text is required") }
-                try input.type(text)
-            case ("POST", "/key"):
-                guard let key = body["key"] as? String else { return .error("key is required") }
-                try input.key(key, modifiers: (body["modifiers"] as? [String]) ?? [])
-            case ("POST", "/home"):
-                input.consumer(0x0223)
-            default:
-                return .error("not found", status: 404)
+            let reports: [ReportID]
+            switch request.path {
+            case "/tap", "/swipe": reports = [.absolutePointer, .relativeMouse]
+            case "/move": reports = [.absolutePointer]
+            case "/nudge": reports = [.relativeMouse]
+            case "/type", "/key": reports = [.keyboard]
+            default: reports = [.consumer]
             }
-            return .json(["ok": true, "device": device.id])
+            return try Devices.shared.withInput(for: device, requiring: reports) { input in
+                switch (request.method, request.path) {
+                case ("POST", "/tap"):
+                    let (x, y) = try point(body, "x", "y", on: device)
+                    try input.tap(x: x, y: y, hold: (body["hold"] as? Double) ?? 0.08)
+                case ("POST", "/swipe"):
+                    let from = try point(body, "x1", "y1", on: device)
+                    let to = try point(body, "x2", "y2", on: device)
+                    try input.swipe(from: from, to: to, duration: (body["duration"] as? Double) ?? 0.3)
+                case ("POST", "/move"):
+                    let (x, y) = try point(body, "x", "y", on: device)
+                    try input.move(x: x, y: y)
+                case ("POST", "/nudge"):
+                    try input.nudge(
+                        dx: (body["dx"] as? Int) ?? 0, dy: (body["dy"] as? Int) ?? 0,
+                        click: (body["click"] as? Bool) ?? false)
+                case ("POST", "/type"):
+                    guard let text = body["text"] as? String else { return .error("text is required") }
+                    try input.type(text)
+                case ("POST", "/key"):
+                    guard let key = body["key"] as? String else { return .error("key is required") }
+                    try input.key(key, modifiers: (body["modifiers"] as? [String]) ?? [])
+                case ("POST", "/home"):
+                    try input.consumer(0x0223)
+                default:
+                    return .error("not found", status: 404)
+                }
+                return .json(["ok": true, "device": device.id])
+            }
         } catch {
             return .error("\(error)")
         }

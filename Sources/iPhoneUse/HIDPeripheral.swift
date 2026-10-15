@@ -11,7 +11,18 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
     private let queue = DispatchQueue(label: "iphone-use.bluetooth")
     private var manager: CBPeripheralManager!
     private var servicesToAdd: [CBMutableService] = []
+    private var addingService: CBMutableService?
     private var published = false
+    private lazy var pairingConsent = BLEPairingConsent(queue: queue)
+
+    var pairingStatus: String { queue.sync { pairingConsent.status } }
+
+    func openPairingWindow(targetName: String) throws {
+        try queue.sync {
+            guard manager?.state == .poweredOn, published else { throw DeviceError("Bluetooth HID service is not ready") }
+            try pairingConsent.openWindow(targetName: targetName)
+        }
+    }
 
     private var inputs: [ReportID: CBMutableCharacteristic] = [:]
     private var keyboardOutput: CBMutableCharacteristic!
@@ -25,7 +36,23 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
     private var serviceChangedSent = Set<UUID>()
     private var outbox: [(CBMutableCharacteristic, Data, [CBCentral]?)] = []
 
-    private(set) var state: String = "starting"
+    private var stateDescription = "starting"
+    var state: String {
+        if CBManager.authorization == .notDetermined { return "waiting for Bluetooth permission" }
+        return queue.sync { stateDescription }
+    }
+
+    /// Report subscriptions are more useful than a generic "connected" flag when
+    /// pairing completed but iOS has not discovered the mouse/keyboard channels.
+    var hostDiagnostics: [[String: Any]] {
+        queue.sync {
+            hostsWithInput.sorted { $0.uuidString < $1.uuidString }.map { host in
+                ["id": host.uuidString, "reports": inputs.compactMap { id, characteristic in
+                    subscriptions[host]?.contains(ObjectIdentifier(characteristic)) == true ? String(describing: id) : nil
+                }.sorted()]
+            }
+        }
+    }
 
     /// Called on the Bluetooth queue when a phone starts or stops listening for input.
     var onHostsChanged: (() -> Void)?
@@ -46,11 +73,27 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
         return subscriptions.filter { !$0.value.isDisjoint(with: ids) }.map(\.key)
     }
 
-    func send(_ id: ReportID, _ bytes: [UInt8], to host: UUID) {
-        queue.async {
-            guard let characteristic = self.inputs[id], let central = self.centrals[host] else { return }
-            self.outbox.append((characteristic, Data(bytes), [central]))
-            self.drain()
+    func require(_ reports: [ReportID], from host: UUID) throws {
+        try queue.sync { try requireOnQueue(reports, from: host) }
+    }
+
+    private func requireOnQueue(_ reports: [ReportID], from host: UUID) throws {
+        guard manager?.state == .poweredOn, published, centrals[host] != nil else {
+            throw DeviceError("Bluetooth host \(host) disconnected; reconnect the iPhone")
+        }
+        for report in reports {
+            guard let characteristic = inputs[report],
+                subscriptions[host]?.contains(ObjectIdentifier(characteristic)) == true else {
+                throw DeviceError("Bluetooth host \(host) is not ready for \(report); reconnect the iPhone and enable AssistiveTouch")
+            }
+        }
+    }
+
+    func send(_ id: ReportID, _ bytes: [UInt8], to host: UUID) throws {
+        try queue.sync {
+            try requireOnQueue([id], from: host)
+            outbox.append((inputs[id]!, Data(bytes), [centrals[host]!]))
+            drain()
         }
     }
 
@@ -123,7 +166,9 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
             advertise()
             return
         }
-        manager.add(servicesToAdd.removeFirst())
+        let next = servicesToAdd.removeFirst()
+        addingService = next
+        manager.add(next)
     }
 
     private func advertise() {
@@ -136,29 +181,53 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
 
     // MARK: CBPeripheralManagerDelegate
 
+    // Private delegate callback, verified on macOS 26.1. Unlike subscriptions,
+    // this arrives before the encrypted HID read that triggers first pairing.
+    @objc(peripheralManager:didUpdateConnectionParameters:interval:latency:supervisionTimeout:)
+    func peripheralManager(
+        _ peripheral: CBPeripheralManager, didUpdateConnectionParameters central: CBCentral,
+        interval: NSNumber?, latency: NSNumber?, supervisionTimeout: NSNumber?
+    ) {
+        log("incoming central \(central.identifier) connection parameters updated")
+        pairingConsent.connected(central)
+    }
+
     func peripheralManagerDidUpdateState(_ peripheral: CBPeripheralManager) {
         log("bluetooth state \(peripheral.state.rawValue) auth \(CBManager.authorization.rawValue)")
+        // A radio reset invalidates every subscription and queued input. Never
+        // replay old taps or retain a false connection after it comes back.
+        centrals.removeAll()
+        subscriptions.removeAll()
+        serviceChangedSent.removeAll()
+        outbox.removeAll()
+        inputs.removeAll()
+        servicesToAdd.removeAll()
+        addingService = nil
+        published = false
+        pairingConsent.reset()
         switch peripheral.state {
         case .poweredOn:
-            state = "powered on"
+            pairingConsent.start()
+            stateDescription = "powered on"
             peripheral.removeAllServices()
-            inputs = [:]
-            published = false
             servicesToAdd = buildServices()
             addNextService()
         case .unauthorized:
-            state = "bluetooth not allowed (System Settings > Privacy & Security > Bluetooth)"
+            stateDescription = "bluetooth not allowed (System Settings > Privacy & Security > Bluetooth)"
         case .poweredOff:
-            state = "bluetooth off"
+            stateDescription = "bluetooth off"
         default:
-            state = "bluetooth unavailable (\(peripheral.state.rawValue))"
+            stateDescription = "bluetooth unavailable (\(peripheral.state.rawValue))"
         }
+        onHostsChanged?()
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, didAdd service: CBService, error: Error?) {
+        guard peripheral.state == .poweredOn, addingService === service else { return }
+        addingService = nil
         if let error {
-            state = "failed to add \(service.uuid): \(error.localizedDescription)"
-            log(state)
+            stateDescription = "failed to add \(service.uuid): \(error.localizedDescription)"
+            log(stateDescription)
             return
         }
         log("added service \(service.uuid)")
@@ -166,12 +235,13 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
     }
 
     func peripheralManagerDidStartAdvertising(_ peripheral: CBPeripheralManager, error: Error?) {
+        guard peripheral.state == .poweredOn, published else { return }
         if let error, (error as? CBError)?.code != .alreadyAdvertising {
-            state = "advertising failed: \(error.localizedDescription)"
+            stateDescription = "advertising failed: \(error.localizedDescription)"
         } else {
-            state = "advertising as \(localName)"
+            stateDescription = "advertising as \(localName)"
         }
-        log(state)
+        log(stateDescription)
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveRead request: CBATTRequest) {
@@ -222,6 +292,14 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
         _ peripheral: CBPeripheralManager, central: CBCentral, didUnsubscribeFrom characteristic: CBCharacteristic
     ) {
         subscriptions[central.identifier]?.remove(ObjectIdentifier(characteristic))
+        outbox.removeAll { item in
+            item.0 === characteristic && item.2?.contains(where: { $0.identifier == central.identifier }) == true
+        }
+        if subscriptions[central.identifier]?.isEmpty != false {
+            subscriptions[central.identifier] = nil
+            centrals[central.identifier] = nil
+            serviceChangedSent.remove(central.identifier)
+        }
         log("unsubscribe \(characteristic.uuid) \(describe(characteristic)) from \(central.identifier)")
         hostsChanged()
     }
@@ -235,13 +313,17 @@ final class HIDPeripheral: NSObject, CBPeripheralManagerDelegate {
     /// Keeps advertising while phones are connected so more can pair.
     private func hostsChanged() {
         let count = hostsWithInput.count
-        state = count == 0 ? "advertising as \(localName)" : "\(count) connected, advertising as \(localName)"
+        stateDescription = count == 0 ? "advertising as \(localName)" : "\(count) connected, advertising as \(localName)"
         advertise()
         onHostsChanged?()
     }
 
     private func drain() {
         while let (characteristic, data, targets) = outbox.first {
+            guard manager.state == .poweredOn, published else { outbox.removeAll(); return }
+            guard let targets, !targets.isEmpty, targets.allSatisfy({
+                subscriptions[$0.identifier]?.contains(ObjectIdentifier(characteristic)) == true
+            }) else { outbox.removeFirst(); continue }
             guard manager.updateValue(data, for: characteristic, onSubscribedCentrals: targets) else { return }
             outbox.removeFirst()
         }

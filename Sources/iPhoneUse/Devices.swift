@@ -23,21 +23,24 @@ struct Device {
 final class Devices {
     static let shared = Devices()
 
-    private static let thumbWidth = 90
-    private static let thumbHeight = 195
-
     private let lock = NSLock()
-    private var pairings: [String: UUID] = [:]
+    private var bindings = DeviceBindings()
     private var inputs: [UUID: Input] = [:]
     private var matchPending = false
-    private let matchQueue = DispatchQueue(label: "iphone-use.match")
+    private let matchQueue = DispatchQueue(label: "iphone-use.match", attributes: .concurrent)
 
-    private let file: URL = {
+    private let file: URL
+
+    init(file: URL? = nil) {
+        if let file {
+            self.file = file
+            return
+        }
         let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("iPhoneUse", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        return directory.appendingPathComponent("pairings.json")
-    }()
+        self.file = directory.appendingPathComponent("pairings.json")
+    }
 
     func start() {
         load()
@@ -47,7 +50,7 @@ final class Devices {
 
     func all() -> [Device] {
         let hosts = Set(HIDPeripheral.shared.connectedHosts)
-        let pairings = lock.withLock { self.pairings }
+        let pairings = lock.withLock { bindings.pairings }
         return ScreenCapture.shared.all.map { screen in
             Device(screen: screen, host: pairings[screen.id].flatMap { hosts.contains($0) ? $0 : nil })
         }
@@ -63,12 +66,12 @@ final class Devices {
     func find(_ query: String?) throws -> Device {
         let devices = all()
         if let query, !query.isEmpty {
-            let q = query.lowercased()
-            let hit =
-                devices.first { $0.id.lowercased() == q } ?? devices.first { $0.screen.name.lowercased() == q }
-                ?? devices.first { $0.id.lowercased().hasPrefix(q) }
-            guard let hit else { throw DeviceError("no phone matches \"\(query)\". \(Self.describe(devices))") }
-            return hit
+            let ids = DeviceSelection.matches(query, in: devices.map { ($0.id, $0.screen.name) })
+            guard !ids.isEmpty else { throw DeviceError("no phone matches \"\(query)\". \(Self.describe(devices))") }
+            guard ids.count == 1 else {
+                throw DeviceError("ambiguous device \"\(query)\"; pass its full id. \(Self.describe(devices))")
+            }
+            return devices.first { $0.id == ids[0] }!
         }
         guard !devices.isEmpty else {
             throw DeviceError("no iPhone screen: plug the iPhone in over USB and unlock it")
@@ -79,19 +82,24 @@ final class Devices {
         return devices[0]
     }
 
-    /// The phone's input, matching its Bluetooth connection first when needed.
-    func input(for device: Device) throws -> Input {
-        if let host = device.host { return input(for: host) }
-        match()
-        if let host = try find(device.id).host { return input(for: host) }
-        if unmatchedHosts().isEmpty {
-            throw DeviceError(
-                "\(device.screen.name) has no Bluetooth connection: pair \"\(HIDPeripheral.shared.localName)\" in its Bluetooth settings"
-            )
+    /// Readers may control different phones concurrently. Rematching/manual binding
+    /// uses a barrier, so an in-flight gesture cannot be redirected by a rematch.
+    func withInput<T>(for device: Device, requiring reports: [ReportID], _ action: (Input) throws -> T) throws -> T {
+        if try find(device.id).host == nil { match() }
+        return try matchQueue.sync {
+            guard let host = try find(device.id).host else {
+                if unmatchedHosts().isEmpty {
+                    throw DeviceError(
+                        "\(device.screen.name) has no verified Bluetooth connection: pair \"\(HIDPeripheral.shared.localName)\" in its Bluetooth settings, enable AssistiveTouch, then POST /match"
+                    )
+                }
+                throw DeviceError(
+                    "could not verify which Bluetooth connection is \(device.screen.name): unlock it, enable AssistiveTouch, keep its screen still, then POST /match"
+                )
+            }
+            try HIDPeripheral.shared.require(reports, from: host)
+            return try action(input(for: host))
         }
-        throw DeviceError(
-            "could not tell which Bluetooth connection is \(device.screen.name): unlock it, check AssistiveTouch is on, then POST /match"
-        )
     }
 
     func input(for host: UUID) -> Input {
@@ -103,16 +111,25 @@ final class Devices {
         }
     }
 
-    func pair(_ device: Device, host: UUID) {
-        store([device.id: host])
+    func pair(_ device: Device, host: UUID) throws {
+        try matchQueue.sync(flags: .barrier) {
+            _ = try find(device.id)
+            guard HIDPeripheral.shared.connectedHosts.contains(host) else {
+                throw DeviceError("Bluetooth host is not connected; pair the phone in Bluetooth settings first")
+            }
+            lock.withLock {
+                bindings.assign(screen: device.id, host: host)
+                saveLocked()
+            }
+        }
     }
 
     /// Matches unmatched hosts to unmatched screens and waits for the result.
-    /// `force` rematches every screen present; a screen nothing is found for keeps its match.
-    /// `probe` checks the pointer even with one phone, where the match is otherwise assumed.
+    /// `force` revokes existing matches before testing, including when no new match is found.
+    /// `probe` is retained for API compatibility; new matches are always verified.
     @discardableResult
     func match(force: Bool = false, probe: Bool = false) -> [String: UUID] {
-        matchQueue.sync { runMatch(force: force, alwaysProbe: probe) }
+        matchQueue.sync(flags: .barrier) { runMatch(force: force) }
     }
 
     // MARK: Matching
@@ -123,106 +140,85 @@ final class Devices {
             return matchPending
         }
         guard !alreadyPending else { return }
-        matchQueue.asyncAfter(deadline: .now() + 1.5) {
+        matchQueue.asyncAfter(deadline: .now() + 1.5, flags: .barrier) {
             self.lock.withLock { self.matchPending = false }
-            self.runMatch(force: false, alwaysProbe: false)
+            self.runMatch(force: false)
         }
     }
 
     @discardableResult
-    private func runMatch(force: Bool, alwaysProbe: Bool) -> [String: UUID] {
+    private func runMatch(force: Bool) -> [String: UUID] {
         let screens = ScreenCapture.shared.all
         let hosts = HIDPeripheral.shared.connectedHosts
-        var pairings = lock.withLock { self.pairings }
-        if force { for screen in screens { pairings[screen.id] = nil } }
-
-        let matchedHosts = Set(screens.compactMap { pairings[$0.id] }.filter(hosts.contains))
-        var freeScreens = screens.filter { pairings[$0.id].map { !hosts.contains($0) } ?? true }
-        let freeHosts = hosts.filter { !matchedHosts.contains($0) }
-        guard !freeScreens.isEmpty, !freeHosts.isEmpty else { return [:] }
-
-        var found: [String: UUID] = [:]
-        if screens.count == 1, hosts.count == 1, !alwaysProbe {
-            found[screens[0].id] = hosts[0]
-        } else {
-            for host in freeHosts where !freeScreens.isEmpty {
-                guard let screen = probe(host, among: freeScreens) else { continue }
-                found[screen.id] = host
-                freeScreens.removeAll { $0.id == screen.id }
+        if force {
+            lock.withLock {
+                bindings.forget(screens.map(\.id))
+                saveLocked()
             }
         }
-        store(found)
+        var updated = lock.withLock { bindings }
+        let found = updated.match(screens: screens.map(\.id), hosts: hosts) { host, candidates in
+            probe(host, among: screens.filter { candidates.contains($0.id) })?.id
+        }
+        if !found.isEmpty {
+            lock.withLock {
+                bindings = updated
+                saveLocked()
+            }
+        }
         for (id, host) in found {
             log("matched \(screens.first { $0.id == id }?.name ?? id) to bluetooth host \(host)")
         }
         return found
     }
 
-    /// Moves the host's pointer between two spots and returns the one screen where both
-    /// spots changed and the rest of the screen did not.
+    /// Move only the pointer, never click while discovering a phone's identity.
     private func probe(_ host: UUID, among screens: [Screen]) -> Screen? {
+        guard (try? HIDPeripheral.shared.require([.absolutePointer], from: host)) != nil else { return nil }
         let input = input(for: host)
-        let a = (x: 0.3, y: 0.35)
-        let b = (x: 0.7, y: 0.65)
-        input.move(x: a.x, y: a.y)
-        Thread.sleep(forTimeInterval: 0.6)
-        let before = screens.map { $0.thumbnail(width: Self.thumbWidth, height: Self.thumbHeight) }
-        input.move(x: b.x, y: b.y)
-        Thread.sleep(forTimeInterval: 0.6)
-        let after = screens.map { $0.thumbnail(width: Self.thumbWidth, height: Self.thumbHeight) }
-
-        var scores: [(screen: Screen, score: Int)] = []
-        for (i, screen) in screens.enumerated() {
-            guard let p = before[i], let q = after[i] else { continue }
-            let signal = min(Self.changed(p, q, around: a), Self.changed(p, q, around: b))
-            let noise = max(Self.changed(p, q, around: (a.x, b.y)), Self.changed(p, q, around: (b.x, a.y)))
-            scores.append((screen, signal - noise))
-        }
-        log("probe \(host): " + scores.map { "\($0.screen.name)=\($0.score)" }.joined(separator: " "))
-
-        let ranked = scores.sorted { $0.score > $1.score }
-        guard let best = ranked.first, best.score >= 3 else { return nil }
-        if ranked.count > 1, ranked[1].score * 2 >= best.score { return nil }
-        return best.screen
-    }
-
-    /// Pixels that changed noticeably in a small box around a point.
-    private static func changed(_ p: [UInt8], _ q: [UInt8], around point: (Double, Double)) -> Int {
-        let radius = 7
-        let cx = Int(point.0 * Double(thumbWidth))
-        let cy = Int(point.1 * Double(thumbHeight))
-        var count = 0
-        for y in max(0, cy - radius)...min(thumbHeight - 1, cy + radius) {
-            for x in max(0, cx - radius)...min(thumbWidth - 1, cx + radius) {
-                let i = y * thumbWidth + x
-                if abs(Int(p[i]) - Int(q[i])) > 12 { count += 1 }
+        var frames = screens.map { _ in [[UInt8]]() }
+        for position in PointerVerification.positions {
+            do { try input.move(x: position.x, y: position.y) }
+            catch { log("pointer probe interrupted: \(error)"); return nil }
+            Thread.sleep(forTimeInterval: 0.6)
+            for (index, screen) in screens.enumerated() {
+                if let pixels = screen.thumbnail(width: PointerVerification.width, height: PointerVerification.height) {
+                    frames[index].append(pixels)
+                }
             }
         }
-        return count
+        let verified = screens.enumerated().compactMap { index, screen -> Screen? in
+            let score = PointerVerification.score(frames[index])
+            log("probe \(host): \(screen.name)=\(score.map(String.init) ?? "unverified")")
+            return score == nil ? nil : screen
+        }
+        // Ambiguity is a failed match even if one screen has a stronger signal.
+        guard verified.count == 1,
+            HIDPeripheral.shared.connectedHosts.contains(host),
+            ScreenCapture.shared.all.contains(where: { $0.id == verified[0].id })
+        else { return nil }
+        return verified[0]
     }
 
     // MARK: Saved matches
 
-    /// One host drives one screen, so a new match replaces the host's old one.
-    private func store(_ found: [String: UUID]) {
-        guard !found.isEmpty else { return }
-        lock.withLock {
-            for (id, host) in found {
-                for (other, existing) in pairings where existing == host { pairings[other] = nil }
-                pairings[id] = host
-            }
-            let encoded = pairings.mapValues(\.uuidString)
-            if let data = try? JSONSerialization.data(withJSONObject: encoded, options: [.prettyPrinted]) {
-                try? data.write(to: file)
-            }
+    /// Caller holds lock. Atomic writes keep interrupted saves from corrupting associations.
+    private func saveLocked() {
+        do {
+            try bindings.encoded().write(to: file, options: .atomic)
+        } catch {
+            log("could not save device bindings: \(error)")
         }
     }
 
     private func load() {
-        guard let data = try? Data(contentsOf: file),
-            let saved = try? JSONSerialization.jsonObject(with: data) as? [String: String]
-        else { return }
-        lock.withLock { pairings = saved.compactMapValues(UUID.init(uuidString:)) }
+        guard let data = try? Data(contentsOf: file) else { return }
+        do {
+            let saved = try DeviceBindings(data: data)
+            lock.withLock { bindings = saved }
+        } catch {
+            log("ignoring legacy or invalid device bindings; pointer verification is required")
+        }
     }
 
     private static func describe(_ devices: [Device]) -> String {
